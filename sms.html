@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SMS Manager Pro - Quản lý tin nhắn chuyên nghiệp</title>
+    <link rel="stylesheet" href="style.css">
+    <link href="https://cdn.jsdelivr.net/npm/boxicons@2.1.4/css/boxicons.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link href='https://unpkg.com/boxicons@2.1.4/css/boxicons.min.css' rel='stylesheet'>
+</head>
+<body>
+    <!-- Header -->
+    <header class="header">
+        <div class="container">
+            <div class="header-content">
+                <div class="logo">
+                    <i class='bx bx-message-dots'></i>
+                    <span>TRUNG TÂM TIN NHẮN EM919X 5G</span>
+                </div>
+                <div class="header-actions">
+                    <button class="btn btn-outline" id="refreshBtn">
+                        <i class='bx bx-refresh'></i>
+                        Làm mới
+                    </button>
+                    <div class="user-menu">
+                        <i class='bx bx-user-circle'></i>
+                        <span>Admin</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </header>
+
+
+    <!-- Main Content -->
+    <main class="main-content">
+        <div class="container">
+            <div class="content-grid">
+                
+                <!-- Sidebar -->
+                <aside class="sidebar">
+                    <!-- Stats Cards -->
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <div class="stat-icon primary">
+                                <i class='bx bx-message'></i>
+                            </div>
+                            <div class="stat-info">
+                                <div class="stat-number" id="totalMessages">0</div>
+                                <div class="stat-label">Tổng tin nhắn</div>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon success">
+                                <i class='bx bx-message-check'></i>
+                            </div>
+                            <div class="stat-info">
+                                <div class="stat-number" id="sentMessages">0</div>
+                                <div class="stat-label">Đã gửi</div>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon warning">
+                                <i class='bx bx-message-dots'></i>
+                            </div>
+                            <div class="stat-info">
+                                <div class="stat-number" id="receivedMessages">0</div>
+                                <div class="stat-label">Đã nhận</div>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon info">
+                                <i class='bx bx-message-alt-error'></i>
+                            </div>
+                            <div class="stat-info">
+                                <div class="stat-number" id="unreadMessages">0</div>
+                                <div class="stat-label">Chưa đọc</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Quick Actions -->
+                    <div class="quick-actions">
+                        <h3 class="section-title">
+                            <i class='bx bx-zap'></i>
+                            Thao tác nhanh
+                        </h3>
+                        <div class="action-buttons">
+                            <button class="action-btn primary" id="newMessageBtn">
+                                <i class='bx bx-plus'></i>
+                                Tin nhắn mới
+                            </button>
+                            <button class="action-btn success" id="exportBtn">
+                                <i class='bx bx-download'></i>
+                                Xuất dữ liệu
+                            </button>
+                            <button class="action-btn warning" id="bulkDeleteBtn">
+                                <i class='bx bx-trash'></i>
+                                Xóa hàng loạt
+                            </button>
+                        </div>
+                    </div>
+                    <!-- Basic -->
+                    <div class="auto-refresh-settings">
+                        <label>
+                            <input type="checkbox" id="userActivityPause">
+                            Tạm dừng khi có hoạt động
+                        </label>
+                        <select id="activityDelay">
+                            <option value="15">15 giây</option>
+                            <option value="30" selected>30 giây</option>
+                            <option value="60">60 giây</option>
+                        </select>
+                    </div>
+                    <!-- Filter Panel -->
+                    <div class="filter-panel">
+                        <h3 class="section-title">
+                            <i class='bx bx-filter'></i>
+                            Bộ lọc
+                        </h3>
+                        
+                        <div class="filter-group">
+                            <label class="filter-label">Loại tin nhắn</label>
+                            <select class="form-select" id="messageType">
+                                <option value="">Tất cả</option>
+                                <option value="received">Tin nhắn đến</option>
+                                <option value="sent">Tin nhắn gửi</option>
+                            </select>
+                        </div>
+
+                        <div class="filter-group">
+                            <label class="filter-label">Trạng thái</label>
+                            <select class="form-select" id="readStatus">
+                                <option value="">Tất cả</option>
+                                <option value="unread">Chưa đọc</option>
+                                <option value="read">Đã đọc</option>
+                            </select>
+                        </div>
+
+                        <div class="filter-group">
+                            <label class="filter-label">Thời gian</label>
+                            <select class="form-select" id="timeFilter">
+                                <option value="">Tất cả</option>
+                                <option value="today">Hôm nay</option>
+                                <option value="yesterday">Hôm qua</option>
+                                <option value="thisWeek">Tuần này</option>
+                                <option value="lastWeek">Tuần trước</option>
+                                <option value="thisMonth">Tháng này</option>
+                                <option value="lastMonth">Tháng trước</option>
+                            </select>
+                        </div>
+
+                        <div class="filter-group">
+                            <label class="filter-label">Tìm kiếm</label>
+                            <div class="search-box">
+                                <i class='bx bx-search'></i>
+                                <input type="text" id="searchInput" placeholder="Tìm theo số điện thoại hoặc nội dung...">
+                            </div>
+                        </div>
+
+                        <div class="filter-actions">
+                            <button class="btn btn-primary btn-small" id="applyFilter">
+                                <i class='bx bx-check'></i>
+                                Áp dụng
+                            </button>
+                            <button class="btn btn-outline btn-small" id="clearFilter">
+                                <i class='bx bx-x'></i>
+                                Xóa bộ lọc
+                            </button>
+                        </div>
+                    </div>
+                </aside>
+
+                <!-- Content Area -->
+                <div class="content-area">
+                    
+                    <!-- Toolbar -->
+                    <div class="toolbar">
+                        <div class="toolbar-left">
+                            <div class="view-tabs">
+                                <button class="tab-btn active" data-view="all">
+                                    <i class='bx bx-list-ul'></i>
+                                    Tất cả
+                                </button>
+                                <button class="tab-btn" data-view="received">
+                                    <i class='bx bx-message-rounded-check'></i>
+                                    Tin nhắn đến
+                                </button>
+                                <button class="tab-btn" data-view="sent">
+                                    <i class='bx bx-send'></i>
+                                    Tin nhắn gửi
+                                </button>
+                            </div>
+                        </div>
+                        
+                        <div class="toolbar-right">
+                            <div class="bulk-actions" id="bulkActions" style="display: none;">
+                                <span class="selected-count" id="selectedCount">0 đã chọn</span>
+                                <button class="btn btn-outline btn-small" id="selectAllBtn">
+                                    <i class='bx bx-check-square'></i>
+                                    Chọn tất cả
+                                </button>
+                                <button class="btn btn-success btn-small" id="markReadBtn">
+                                    <i class='bx bx-check-circle'></i>
+                                    Đánh dấu đã đọc
+                                </button>
+                                <button class="btn btn-danger btn-small" id="deleteSelectedBtn">
+                                    <i class='bx bx-trash'></i>
+                                    Xóa đã chọn
+                                </button>
+                            </div>
+                            <!-- Thêm phần tự động làm mới -->
+                            <!-- Thêm indicator hiển thị trạng thái -->
+                            <div id="autoRefreshIndicator" class="auto-refresh-indicator">
+                                <i class='bx bx-refresh'></i> Tắt tự động làm mới
+                            </div>
+                            <div class="auto-refresh-control">
+                                </label>
+                                <select id="autoRefreshSelect" class="form-select">
+                                    <option value="0" selected>Tắt</option>
+                                    <option value="5">5 giây</option>
+                                    <option value="10">10 giây</option>
+                                    <option value="20">20 giây</option>
+                                    <option value="30">30 giây</option>
+                                    <option value="60">60 giây</option>
+                                </select>
+                            </div>
+                            <div class="pagination-info">
+                                <select class="form-select small" id="itemsPerPage">
+                                    <option value="20">20/trang</option>
+                                    <option value="50">50/trang</option>
+                                    <option value="100">100/trang</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Messages List -->
+                    <div class="messages-container">
+                        <div id="messagesLoading" class="loading-state">
+                            <div class="spinner"></div>
+                            <span>Đang tải tin nhắn...</span>
+                        </div>
+
+                        <div id="messagesEmpty" class="empty-state" style="display: none;">
+                            <div class="empty-icon">
+                                <i class='bx bx-message-alt-x'></i>
+                            </div>
+                            <h3>Không có tin nhắn</h3>
+                            <p>Chưa có tin nhắn nào hoặc không tìm thấy kết quả phù hợp với bộ lọc.</p>
+                            <button class="btn btn-primary" id="clearFiltersBtn">
+                                <i class='bx bx-filter-alt'></i>
+                                Xóa bộ lọc
+                            </button>
+                        </div>
+
+                        <div class="messages-list" id="messagesList">
+                            <!-- Messages will be dynamically loaded here -->
+                        </div>
+                    </div>
+
+                    <!-- Pagination -->
+                    <div class="pagination-container">
+                        <div class="pagination" id="pagination">
+                            <!-- Pagination will be dynamically generated -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- New Message Modal -->
+    <div class="modal" id="newMessageModal">
+        <div class="modal-overlay"></div>
+        <div class="modal-container">
+            <div class="modal-header">
+                <h3>
+                    <i class='bx bx-message-add'></i>
+                    Gửi tin nhắn mới
+                </h3>
+                <button class="modal-close" id="closeNewMessageModal">
+                    <i class='bx bx-x'></i>
+                </button>
+            </div>
+            <div class="modal-body">
+                <!-- Cập nhật form trong modal -->
+                <form id="newMessageForm" class="message-form">
+                    <div class="form-group">
+                        <label class="form-label" for="recipientPhone">
+                            <i class='bx bx-phone'></i>
+                            Số điện thoại người nhận
+                        </label>
+                        <input type="tel" id="recipientPhone" class="form-input" 
+                               placeholder="Nhập số điện thoại" 
+                               title="Nhập bất kỳ số điện thoại nào"
+                               required>
+                        <div class="form-hint">Hỗ trợ: số di động, số dịch vụ (888, 9xxx), số cố định, số quốc tế</div>
+                        <div class="form-error" id="phoneError" style="display: none;"></div>
+                    </div>
+
+                
+                    <div class="form-group">
+                        <label class="form-label" for="messageContent">
+                            <i class='bx bx-message-detail'></i>
+                            Nội dung tin nhắn
+                        </label>
+                        <textarea id="messageContent" class="form-textarea" 
+                                  placeholder="Nhập nội dung tin nhắn..." 
+                                  rows="4" 
+                                  maxlength="160" 
+                                  required></textarea>
+                        <div class="form-footer">
+                            <div class="char-counter">
+                                <span id="charCount">0</span>/160 ký tự
+                            </div>
+                            <div class="sms-count">
+                                <span id="smsCount">1</span> tin nhắn
+                            </div>
+                        </div>
+                        <div class="form-error" id="contentError" style="display: none;"></div>
+                    </div>
+                
+                    <div class="form-group">
+                        <label class="form-label">
+                            <i class='bx bx-template'></i>
+                            Mẫu tin nhắn
+                        </label>
+                        <select id="messageTemplate" class="form-select">
+                            <option value="">Chọn mẫu tin nhắn...</option>
+                            <option value="greeting">Chào hỏi khách hàng</option>
+                            <option value="promotion">Thông báo khuyến mãi</option>
+                            <option value="reminder">Nhắc nhở thanh toán</option>
+                            <option value="confirmation">Xác nhận đơn hàng</option>
+                        </select>
+                    </div>
+                
+                    <!-- Thay thế phần connection-status trong modal -->
+                    <div class="connection-status" id="connectionStatus">
+                        <div class="status-indicator" id="statusIndicator">
+                            <i class='bx bx-loader-alt bx-spin'></i>
+                            <span>Đang kiểm tra kết nối...</span>
+                        </div>
+                    </div>
+
+                
+                    <div class="form-actions">
+                        <button type="button" class="btn btn-outline" id="cancelNewMessage">
+                            <i class='bx bx-x'></i>
+                            Hủy
+                        </button>
+                        <button type="submit" class="btn btn-primary" id="sendMessageBtn">
+                            <i class='bx bx-send'></i>
+                            Gửi tin nhắn
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Message Detail Modal -->
+    <div class="modal" id="messageDetailModal">
+        <div class="modal-overlay"></div>
+        <div class="modal-container modal-lg">
+            <div class="modal-header">
+                <h3>
+                    <i class='bx bx-message-detail'></i>
+                    Chi tiết tin nhắn
+                </h3>
+                <button class="modal-close" id="closeMessageDetailModal">
+                    <i class='bx bx-x'></i>
+                </button>
+            </div>
+            <div class="modal-body" id="messageDetailContent">
+                <!-- Content will be dynamically loaded -->
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Notifications -->
+    <div class="toast-container" id="toastContainer">
+        <!-- Toasts will be dynamically added here -->
+    </div>
+
+    <!-- Script -->
+    <script src="script.js"></script>
+</body>
+</html>
