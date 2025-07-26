@@ -1,0 +1,409 @@
+#!/bin/sh
+echo "Content-Type: application/json; charset=utf-8"
+echo ""
+
+# === DEBUG LOG ===
+DEBUG_LOG="/tmp/sms-delete-debug.log"
+debug() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$DEBUG_LOG"
+}
+
+debug "=== SMS-DELETE START (NO BACKUP) ==="
+
+# === CẤU HÌNH ===
+ARCHIVE_DIR="/root/sms-archive"
+CURRENT_MONTH=$(date "+%Y-%m")
+MONTHLY_FILE="$ARCHIVE_DIR/messages-${CURRENT_MONTH}.json"
+TEMP_FILE="/tmp/messages_delete_temp_$$.json"
+
+debug "Monthly file: $MONTHLY_FILE"
+
+# === HÀM ESCAPE JSON ===
+escape_json() {
+    echo "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g; s/\r/\\r/g; s/\n/\\n/g'
+}
+
+# === HÀM TRẢ VỀ LỖI ===
+return_error() {
+    local error_code="$1"
+    local message="$2"
+    local details="$3"
+    
+    debug "ERROR: $error_code - $message - $details"
+    
+    cat << EOF
+{
+    "success": false,
+    "error_code": "$error_code",
+    "message": "$(escape_json "$message")",
+    "details": "$(escape_json "$details")",
+    "deleted": [],
+    "failed": [],
+    "total": 0,
+    "deleted_count": 0,
+    "failed_count": 0,
+    "timestamp": "$(date '+%Y-%m-%d %H:%M:%S')"
+}
+EOF
+    exit 1
+}
+
+debug "Starting SMS delete process - Method: $REQUEST_METHOD"
+
+# === LẤY DANH SÁCH ID ===
+IDS=""
+
+if [ "$REQUEST_METHOD" = "POST" ]; then
+    # Đọc POST data
+    if [ -n "$CONTENT_LENGTH" ] && [ "$CONTENT_LENGTH" -gt 0 ]; then
+        POST_DATA=$(dd bs="$CONTENT_LENGTH" count=1 2>/dev/null)
+    else
+        read -r POST_DATA
+    fi
+    
+    debug "POST_DATA: $POST_DATA"
+    
+    # Parse Content-Type
+    CONTENT_TYPE=$(echo "$CONTENT_TYPE" | tr '[:upper:]' '[:lower:]')
+    
+    if echo "$CONTENT_TYPE" | grep -q "application/json"; then
+        # Parse JSON: {"ids": ["14", "15"]} hoặc {"message_ids": ["14"]}
+        IDS=$(echo "$POST_DATA" | sed -n 's/.*"ids"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/\1/p' | sed 's/"//g' | sed 's/[[:space:]]*,[[:space:]]*/,/g')
+        
+        if [ -z "$IDS" ]; then
+            IDS=$(echo "$POST_DATA" | sed -n 's/.*"message_ids"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/\1/p' | sed 's/"//g' | sed 's/[[:space:]]*,[[:space:]]*/,/g')
+        fi
+        
+        if [ -z "$IDS" ]; then
+            # Parse single ID: {"id": "14"}
+            IDS=$(echo "$POST_DATA" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        fi
+    else
+        # Parse form data: ids=14,15 hoặc ids[]=14&ids[]=15
+        IDS=$(echo "$POST_DATA" | sed -n 's/^.*ids=\([^&]*\).*$/\1/p' | sed 's/%2C/,/g' | sed 's/%20/ /g')
+        
+        if [ -z "$IDS" ]; then
+            # Parse array format: ids[]=14&ids[]=15
+            IDS=$(echo "$POST_DATA" | grep -o 'ids\[\]=[^&]*' | sed 's/ids\[\]=//' | paste -sd ',' -)
+        fi
+    fi
+    
+elif [ "$REQUEST_METHOD" = "GET" ] || [ "$REQUEST_METHOD" = "DELETE" ]; then
+    # Parse query string: ?ids=14,15
+    IDS=$(echo "$QUERY_STRING" | sed -n 's/^.*ids=\([^&]*\).*$/\1/p' | sed 's/%2C/,/g' | sed 's/%20/ /g')
+    
+    if [ -z "$IDS" ]; then
+        # Parse single id: ?id=14
+        IDS=$(echo "$QUERY_STRING" | sed -n 's/^.*id=\([^&]*\).*$/\1/p')
+    fi
+    
+    debug "QUERY_STRING: $QUERY_STRING"
+fi
+
+debug "Parsed IDS: $IDS"
+
+# === VALIDATION INPUT ===
+if [ -z "$IDS" ]; then
+    return_error "missing_ids" "Không có ID tin nhắn để xóa" "Vui lòng cung cấp danh sách ID qua parameter 'ids' hoặc 'id'"
+fi
+
+# === TẠO THU MỤC ARCHIVE NẾU CHƯA CÓ ===
+if [ ! -d "$ARCHIVE_DIR" ]; then
+    debug "Creating archive directory: $ARCHIVE_DIR"
+    mkdir -p "$ARCHIVE_DIR" || {
+        return_error "archive_dir_create_failed" "Không thể tạo thư mục archive" "Path: $ARCHIVE_DIR"
+    }
+    chmod 755 "$ARCHIVE_DIR"
+fi
+
+# Kiểm tra monthly archive file
+if [ ! -f "$MONTHLY_FILE" ]; then
+    return_error "archive_not_found" "File archive tháng hiện tại không tồn tại" "Đường dẫn: $MONTHLY_FILE"
+fi
+
+# === KIỂM TRA QUYỀN TRUY CẬP ===
+debug "Checking file permissions"
+debug "Monthly file exists: $([ -f "$MONTHLY_FILE" ] && echo 'yes' || echo 'no')"
+debug "Monthly file readable: $([ -r "$MONTHLY_FILE" ] && echo 'yes' || echo 'no')"
+debug "Monthly file writable: $([ -w "$MONTHLY_FILE" ] && echo 'yes' || echo 'no')"
+
+if [ ! -r "$MONTHLY_FILE" ]; then
+    return_error "archive_no_read_permission" "Không có quyền đọc file archive" "Đường dẫn: $MONTHLY_FILE"
+fi
+
+if [ ! -w "$MONTHLY_FILE" ]; then
+    return_error "archive_no_write_permission" "Không có quyền ghi vào file archive" "Đường dẫn: $MONTHLY_FILE"
+fi
+
+# === FILE LOCKING ===
+LOCK_FILE="$MONTHLY_FILE.lock"
+exec 200>"$LOCK_FILE"
+if ! flock -n 200; then
+    return_error "file_locked" "File đang được sử dụng bởi process khác" "Vui lòng thử lại sau"
+fi
+
+debug "File locking successful, proceeding without backup"
+
+# === KHỞI TẠO BIẾN ĐẾM ===
+DELETED_COUNT=0
+FAILED_COUNT=0
+TOTAL_COUNT=0
+DELETED_IDS=""
+FAILED_IDS=""
+
+# === XỬ LÝ XÓA MESSAGES THEO ID ===
+debug "Processing delete for IDs: $IDS"
+
+# Tạo danh sách IDs để xóa
+DELETE_IDS_LIST=""
+IFS=','
+for ID in $IDS; do
+    # Làm sạch ID - chỉ giữ lại số
+    CLEAN_ID=$(echo "$ID" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sed 's/[^0-9]//g')
+    
+    # Bỏ qua ID rỗng hoặc không hợp lệ
+    if [ -z "$CLEAN_ID" ] || [ "$CLEAN_ID" = "0" ]; then
+        debug "Skipping invalid ID: '$ID'"
+        continue
+    fi
+    
+    TOTAL_COUNT=$((TOTAL_COUNT + 1))
+    
+    if [ -z "$DELETE_IDS_LIST" ]; then
+        DELETE_IDS_LIST="$CLEAN_ID"
+    else
+        DELETE_IDS_LIST="$DELETE_IDS_LIST,$CLEAN_ID"
+    fi
+    
+    debug "Added ID $CLEAN_ID to delete list"
+done
+
+debug "Final delete IDs list: $DELETE_IDS_LIST"
+
+if [ -z "$DELETE_IDS_LIST" ]; then
+    flock -u 200
+    return_error "no_valid_ids" "Không có ID hợp lệ để xóa" "Tất cả IDs đều không hợp lệ"
+fi
+
+# === XỬ LÝ JSON VỚI JQ HOẶC AWK ===
+SUCCESS=false
+
+if command -v jq >/dev/null 2>&1; then
+    debug "Using jq for JSON processing"
+    
+    # Đọc file hiện tại
+    CURRENT_JSON=$(cat "$MONTHLY_FILE")
+    
+    # Tạo filter jq để xóa messages có ID trong danh sách
+    JQ_IDS_ARRAY="[$(echo "$DELETE_IDS_LIST" | sed 's/,/,/g' | sed 's/[^,0-9]//g')]"
+    
+    debug "JQ IDs array: $JQ_IDS_ARRAY"
+    
+    # Đếm số messages trước khi xóa
+    OLD_COUNT=$(echo "$CURRENT_JSON" | jq '.messages | length' 2>/dev/null || echo 0)
+    debug "Messages before delete: $OLD_COUNT"
+    
+    # Xử lý xóa với jq
+    CURRENT_TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    NEW_JSON=$(echo "$CURRENT_JSON" | jq --argjson delete_ids "$JQ_IDS_ARRAY" \
+        --arg timestamp "$CURRENT_TIMESTAMP" '
+        # Lưu messages cũ để so sánh
+        (.messages | map(select(.id as $id | $delete_ids | index($id) | not))) as $remaining_messages |
+        # Cập nhật file với messages còn lại
+        .messages = $remaining_messages |
+        .total = ($remaining_messages | length) |
+        .last_updated = $timestamp
+    ' 2>/dev/null)
+    
+    if [ $? -eq 0 ] && [ -n "$NEW_JSON" ]; then
+        # Đếm số messages sau khi xóa
+        NEW_COUNT=$(echo "$NEW_JSON" | jq '.messages | length' 2>/dev/null || echo 0)
+        DELETED_COUNT=$((OLD_COUNT - NEW_COUNT))
+        FAILED_COUNT=$((TOTAL_COUNT - DELETED_COUNT))
+        
+        debug "Messages after delete: $NEW_COUNT"
+        debug "Actually deleted: $DELETED_COUNT"
+        
+        # Lưu file mới trực tiếp
+        echo "$NEW_JSON" > "$TEMP_FILE"
+        
+        if [ -s "$TEMP_FILE" ]; then
+            mv "$TEMP_FILE" "$MONTHLY_FILE"
+            SUCCESS=true
+            DELETED_IDS="$DELETE_IDS_LIST"
+            debug "Successfully deleted $DELETED_COUNT messages using jq"
+        else
+            debug "Failed to write new JSON file"
+            FAILED_IDS="$DELETE_IDS_LIST"
+            FAILED_COUNT=$TOTAL_COUNT
+        fi
+    else
+        debug "jq processing failed"
+        FAILED_IDS="$DELETE_IDS_LIST"
+        FAILED_COUNT=$TOTAL_COUNT
+    fi
+
+else
+    debug "Using awk for JSON processing (jq not available)"
+    
+    # AWK approach - đánh dấu messages để xóa
+    awk -v delete_ids="$DELETE_IDS_LIST" '
+    BEGIN {
+        # Parse danh sách IDs cần xóa
+        split(delete_ids, ids_to_delete, ",")
+        for (i in ids_to_delete) {
+            delete_map[ids_to_delete[i]] = 1
+        }
+        
+        in_messages = 0
+        brace_count = 0
+        current_id = ""
+        current_message = ""
+        skip_message = 0
+        deleted_count = 0
+        total_messages = 0
+    }
+    
+    /"messages"[[:space:]]*:[[:space:]]*\[/ {
+        in_messages = 1
+        print $0
+        next
+    }
+    
+    in_messages && /^\s*\]/ {
+        in_messages = 0
+        print $0
+        next
+    }
+    
+    in_messages {
+        if (/^\s*{/) {
+            brace_count = 1
+            current_message = $0
+            skip_message = 0
+            current_id = ""
+            total_messages++
+        } else if (brace_count > 0) {
+            current_message = current_message "\n" $0
+            
+            # Tìm ID trong message
+            if (/\"id\"[[:space:]]*:[[:space:]]*([0-9]+)/) {
+                match($0, /\"id\"[[:space:]]*:[[:space:]]*([0-9]+)/, arr)
+                current_id = arr[1]
+                if (current_id in delete_map) {
+                    skip_message = 1
+                    deleted_count++
+                }
+            }
+            
+            if (/^\s*}/) {
+                brace_count = 0
+                if (!skip_message) {
+                    print current_message
+                }
+                current_message = ""
+            }
+        }
+    }
+    
+    !in_messages {
+        # Cập nhật total count
+        if (/\"total\"[[:space:]]*:[[:space:]]*[0-9]+/) {
+            gsub(/\"total\"[[:space:]]*:[[:space:]]*[0-9]+/, "\"total\": " (total_messages - deleted_count))
+        }
+        # Cập nhật timestamp
+        if (/\"last_updated\"/) {
+            gsub(/"[^"]*"$/, "\"" strftime("%Y-%m-%d %H:%M:%S") "\"", $0)
+        }
+        print $0
+    }
+    
+    END {
+        print deleted_count > "/tmp/awk_deleted_count_" PROCINFO["pid"]
+    }
+    ' "$MONTHLY_FILE" > "$TEMP_FILE"
+    
+    # Đọc số lượng đã xóa từ AWK
+    if [ -f "/tmp/awk_deleted_count_$$" ]; then
+        DELETED_COUNT=$(cat "/tmp/awk_deleted_count_$$")
+        rm -f "/tmp/awk_deleted_count_$$"
+    else
+        DELETED_COUNT=0
+    fi
+    
+    FAILED_COUNT=$((TOTAL_COUNT - DELETED_COUNT))
+    
+    # Kiểm tra kết quả
+    if [ -s "$TEMP_FILE" ]; then
+        mv "$TEMP_FILE" "$MONTHLY_FILE"
+        SUCCESS=true
+        DELETED_IDS="$DELETE_IDS_LIST"
+        debug "Successfully processed with awk, deleted: $DELETED_COUNT"
+    else
+        SUCCESS=false
+        FAILED_IDS="$DELETE_IDS_LIST"
+        debug "awk processing failed"
+    fi
+fi
+
+# === TẠO JSON ARRAYS ===
+DELETED_ARRAY="[]"
+FAILED_ARRAY="[]"
+
+if [ -n "$DELETED_IDS" ] && [ "$DELETED_COUNT" -gt 0 ]; then
+    DELETED_ARRAY="[$(echo "$DELETED_IDS" | sed 's/,/","/g' | sed 's/^/"/' | sed 's/$/"/')]"
+fi
+
+if [ -n "$FAILED_IDS" ] && [ "$FAILED_COUNT" -gt 0 ]; then
+    FAILED_ARRAY="[$(echo "$FAILED_IDS" | sed 's/,/","/g' | sed 's/^/"/' | sed 's/$/"/')]"
+fi
+
+# === TẠO RESPONSE MESSAGE ===
+if [ "$SUCCESS" = "true" ] && [ "$DELETED_COUNT" -gt 0 ]; then
+    if [ "$DELETED_COUNT" -eq "$TOTAL_COUNT" ]; then
+        MESSAGE="Đã xóa thành công tất cả $DELETED_COUNT tin nhắn từ archive (không backup)"
+    else
+        MESSAGE="Đã xóa thành công $DELETED_COUNT/$TOTAL_COUNT tin nhắn từ archive (không backup)"
+    fi
+else
+    MESSAGE="Không thể xóa tin nhắn nào từ archive"
+    SUCCESS=false
+fi
+
+debug "Final result - Success: $SUCCESS, Deleted: $DELETED_COUNT, Failed: $FAILED_COUNT"
+
+# === TRẢ VỀ JSON RESPONSE ===
+cat << EOF
+{
+    "success": $SUCCESS,
+    "message": "$(escape_json "$MESSAGE")",
+    "total": $TOTAL_COUNT,
+    "deleted_count": $DELETED_COUNT,
+    "failed_count": $FAILED_COUNT,
+    "deleted": $DELETED_ARRAY,
+    "failed": $FAILED_ARRAY,
+    "details": {
+        "monthly_file": "$MONTHLY_FILE",
+        "backup_created": false,
+        "processing_method": "$(command -v jq >/dev/null && echo 'jq' || echo 'awk')",
+        "request_method": "$REQUEST_METHOD",
+        "timestamp": "$(date '+%Y-%m-%d %H:%M:%S')"
+    }
+}
+EOF
+
+# === CLEANUP ===
+rm -f "$TEMP_FILE"
+rm -f "$LOCK_FILE"
+flock -u 200
+
+debug "=== SMS-DELETE END (NO BACKUP) ==="
+
+# === SET EXIT CODE ===
+if [ "$SUCCESS" = "true" ]; then
+    exit 0
+else
+    exit 1
+fi
+

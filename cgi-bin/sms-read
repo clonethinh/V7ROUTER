@@ -1,0 +1,269 @@
+#!/bin/sh
+echo "Content-Type: application/json; charset=utf-8"
+echo ""
+
+# === DEBUG LOG ===
+DEBUG_LOG="/tmp/sms-read-debug.log"
+debug() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$DEBUG_LOG"
+}
+
+debug "=== SMS-READ START ==="
+
+# === CẤU HÌNH ===
+ARCHIVE_DIR="/root/sms-archive"
+mkdir -p "$ARCHIVE_DIR"
+
+CURRENT_MONTH=$(date "+%Y-%m")
+MONTHLY_FILE="$ARCHIVE_DIR/messages-${CURRENT_MONTH}.json"
+TEMP_FILE="/tmp/messages_temp_$$.json"
+
+debug "Monthly file: $MONTHLY_FILE"
+
+# === KHỞI TẠO MONTHLY FILE ===
+init_monthly_file() {
+    if [ ! -f "$MONTHLY_FILE" ] || [ ! -s "$MONTHLY_FILE" ]; then
+        debug "Creating/recreating monthly file"
+        
+        # Tạo dynamic values
+        CURRENT_MONTH_INIT=$(date "+%Y-%m")
+        CURRENT_TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S")
+        
+        cat > "$MONTHLY_FILE" << EOF
+{
+  "month": "$CURRENT_MONTH_INIT",
+  "messages": [],
+  "total": 0,
+  "last_updated": "$CURRENT_TIMESTAMP"
+}
+EOF
+    else
+        debug "Monthly file exists"
+        if command -v jq >/dev/null 2>&1; then
+            if ! jq . "$MONTHLY_FILE" >/dev/null 2>&1; then
+                debug "Monthly file corrupt, recreating"
+                
+                CURRENT_MONTH_INIT=$(date "+%Y-%m")
+                CURRENT_TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S")
+                
+                cat > "$MONTHLY_FILE" << EOF
+{
+  "month": "$CURRENT_MONTH_INIT", 
+  "messages": [],
+  "total": 0,
+  "last_updated": "$CURRENT_TIMESTAMP"
+}
+EOF
+            fi
+        fi
+    fi
+}
+
+# === FILE LOCKING ===
+exec 200>"$MONTHLY_FILE.lock"
+if ! flock -n 200; then
+    debug "Could not acquire lock"
+    echo '{ "messages": [] }'
+    exit 1
+fi
+
+init_monthly_file
+
+# === ESCAPE JSON SAFELY ===
+escape_json_text() {
+    local text="$1"
+    echo "$text" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g; s/\r/\\r/g'
+}
+
+# === THÊM MESSAGE VÀO MONTHLY FILE - SỬA LỖI JQ ===
+add_to_monthly() {
+    local new_message="$1"
+    debug "Adding message to monthly file"
+    
+    # Backup
+    cp "$MONTHLY_FILE" "${MONTHLY_FILE}.backup" 2>/dev/null
+    
+    if command -v jq >/dev/null 2>&1; then
+        debug "Using jq for JSON processing"
+        
+        echo "$new_message" > /tmp/new_msg_$$.json
+        
+        if ! jq . /tmp/new_msg_$$.json >/dev/null 2>&1; then
+            debug "New message JSON is invalid"
+            rm -f /tmp/new_msg_$$.json
+            return 1
+        fi
+        
+        debug "New message JSON is valid"
+        
+        CURRENT_TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+        
+        jq --slurpfile new_msg /tmp/new_msg_$$.json \
+           --arg timestamp "$CURRENT_TIMESTAMP" '
+            .messages += $new_msg |
+            .total = (.messages | length) |
+            .last_updated = $timestamp
+        ' "$MONTHLY_FILE" > "$TEMP_FILE" 2>/tmp/jq_error_$$.log
+        
+        rm -f /tmp/new_msg_$$.json
+        
+        if [ -s "$TEMP_FILE" ] && jq . "$TEMP_FILE" >/dev/null 2>&1; then
+            debug "jq processing successful"
+        else
+            debug "jq processing failed"
+            if [ -f /tmp/jq_error_$$.log ]; then
+                debug "jq error: $(cat /tmp/jq_error_$$.log)"
+                cat /tmp/jq_error_$$.log >> /tmp/jq_error.log
+            fi
+            rm -f "$TEMP_FILE" /tmp/jq_error_$$.log
+        fi
+    else
+        debug "Using awk for JSON processing (fallback)"
+        awk -v new_msg="$new_message" '
+        BEGIN { found_array = 0; added = 0 }
+        /^[[:space:]]*"messages"[[:space:]]*:[[:space:]]*\[/ {
+            print $0
+            found_array = 1
+            next
+        }
+        found_array && /^[[:space:]]*\]/ {
+            if (!added && new_msg != "") {
+                print "    " new_msg
+                added = 1
+            }
+            print $0
+            found_array = 0
+            next
+        }
+        /"last_updated"/ {
+            gsub(/"[^"]*"$/, "\"" strftime("%Y-%m-%d %H:%M:%S") "\"", $0)
+        }
+        { print }
+        ' "$MONTHLY_FILE" > "$TEMP_FILE"
+    fi
+    
+    if [ -s "$TEMP_FILE" ]; then
+        mv "$TEMP_FILE" "$MONTHLY_FILE"
+        debug "Successfully added message to monthly file"
+        return 0
+    else
+        debug "Failed to create temp file or temp file empty"
+        if [ -f "${MONTHLY_FILE}.backup" ]; then
+            mv "${MONTHLY_FILE}.backup" "$MONTHLY_FILE"
+            debug "Rolled back to backup"
+        fi
+        return 1
+    fi
+}
+
+# === ĐỌC MESSAGES TỪ ARCHIVE ===
+read_archive_messages() {
+    debug "Reading messages from archive"
+    if [ -f "$MONTHLY_FILE" ] && command -v jq >/dev/null 2>&1; then
+        jq -r '.messages[]? | @json' "$MONTHLY_FILE" 2>/dev/null
+    fi
+}
+
+is_duplicate_id() {
+    local id="$1"
+    if [ -f "$MONTHLY_FILE" ] && command -v jq >/dev/null 2>&1; then
+        local exists=$(jq --arg id "$id" '.messages[]? | select(.id == ($id | tonumber)) | .id' "$MONTHLY_FILE" 2>/dev/null)
+        [ -n "$exists" ]
+    else
+        grep -q "\"id\": $id" "$MONTHLY_FILE" 2>/dev/null
+    fi
+}
+
+# === MAIN PROCESSING ===
+debug "Starting main processing"
+
+PROCESSED_COUNT=0
+
+# 1. LẤY DANH SÁCH SMS TỪ MODEM
+SMS_LIST=$(mmcli -m 0 --messaging-list-sms 2>/dev/null)
+debug "Raw SMS list: $SMS_LIST"
+
+SMS_IDS=""
+if [ -n "$SMS_LIST" ]; then
+    # Thay vì tăng dần, bạn có thể đổi sort -n thành sort -nr nếu muốn
+    SMS_IDS=$(echo "$SMS_LIST" | grep -oE '/SMS/[0-9]+' | sed 's|/SMS/||g' | sort -nr)
+    debug "Extracted SMS IDs (sorted desc): $SMS_IDS"
+fi
+
+# 2. XỬ LÝ TIN NHẮN MỚI
+for ID in $SMS_IDS; do
+    [ -n "$ID" ] || continue
+    
+    debug "Processing SMS ID: $ID"
+    
+    INFO=$(mmcli -s "$ID" 2>/dev/null)
+    if [ -z "$INFO" ]; then
+        debug "No info returned for SMS $ID"
+        continue
+    fi
+    
+    NUMBER=$(echo "$INFO" | grep "number:" | head -1 | sed 's/.*number:[[:space:]]*//')
+    RAW_TEXT=$(echo "$INFO" | grep "text:" | head -1 | sed 's/.*text:[[:space:]]*//')
+    TYPE=$(echo "$INFO" | grep "pdu type:" | head -1 | sed 's/.*pdu type:[[:space:]]*//')
+    STATE=$(echo "$INFO" | grep "state:" | head -1 | sed 's/.*state:[[:space:]]*//')
+    DATE=$(echo "$INFO" | grep "timestamp:" | head -1 | sed 's/.*timestamp:[[:space:]]*//')
+    
+    debug "SMS $ID - Number: $NUMBER, Raw Text: $RAW_TEXT, Type: $TYPE, State: $STATE"
+    
+    if [ -z "$RAW_TEXT" ] || [ "$STATE" = "receiving" ]; then
+        debug "No text or receiving state for SMS $ID, skipping"
+        continue
+    fi
+    
+    if echo "$DATE" | grep -qE '\+[0-9]{2}$'; then
+        DATE=$(echo "$DATE" | sed 's/+\([0-9][0-9]\)$/+\1:00/')
+    fi
+    
+    TEXT_ESC=$(escape_json_text "$RAW_TEXT")
+    NUMBER_ESC=$(escape_json_text "$NUMBER")
+    
+	# Xác định read_status mặc định theo loại tin nhắn
+	READ_STATUS=1
+	if [ "$TYPE" = "deliver" ]; then
+		READ_STATUS=0
+	fi	
+	
+NEW_MESSAGE="{
+  \"id\": $ID,
+  \"number\": \"$NUMBER_ESC\",
+  \"text\": \"$TEXT_ESC\",
+  \"date\": \"$DATE\",
+  \"type\": \"$TYPE\",
+  \"state\": \"$STATE\",
+  \"storage\": \"router\",
+  \"read_status\": $READ_STATUS
+}"
+
+    debug "Created JSON for SMS $ID"
+    
+    if add_to_monthly "$NEW_MESSAGE"; then
+        debug "Successfully saved SMS $ID to archive"
+        
+        # Xóa SMS khỏi SIM sau khi lưu
+        if mmcli -m 0 --messaging-delete-sms="$ID" >/dev/null 2>&1; then
+            debug "Deleted SMS $ID from SIM"
+        else
+            debug "Failed to delete SMS $ID from SIM"
+        fi
+        
+        PROCESSED_COUNT=$((PROCESSED_COUNT + 1))
+    else
+        debug "Failed to save SMS $ID to archive"
+    fi
+done
+
+debug "Finished processing. Total new messages: $PROCESSED_COUNT"
+
+# 3. IN RA JSON CHUẨN VỚI MẢNG MESSAGES ĐƯỢC SẮP XẾP GIẢM DẦN THEO ID
+jq '.messages |= sort_by(.id) | .messages |= reverse' "$MONTHLY_FILE"
+
+# CLEANUP
+rm -f "$TEMP_FILE" "${MONTHLY_FILE}.backup" /tmp/jq_error_$$.log
+flock -u 200
+
+debug "=== SMS-READ END ==="

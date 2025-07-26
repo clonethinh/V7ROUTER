@@ -1,0 +1,173 @@
+#!/bin/sh
+echo "Content-Type: application/json; charset=utf-8"
+echo ""
+
+# ===== CẤU HÌNH =====
+ARCHIVE_DIR="/root/sms-archive"
+LOG_FILE="/tmp/sms-mark-read.log"
+DEBUG=1  # 1 = bật debug, 0 = tắt debug
+
+# ===== HÀM LOG DEBUG =====
+log_debug() {
+    if [ "$DEBUG" -eq 1 ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+    fi
+}
+
+# ===== HÀM ESCAPE JSON =====
+escape_json() {
+    echo "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g; s/\r/\\r/g; s/\n/\\n/g'
+}
+
+# ===== HÀM TRẢ VỀ LỖI =====
+return_error() {
+    local error_code="$1"
+    local message="$2"
+    local details="$3"
+
+    log_debug "ERROR: $error_code - $message - $details"
+
+    cat << EOF
+{
+    "success": false,
+    "status": "error",
+    "error_code": "$error_code",
+    "message": "$(escape_json "$message")",
+    "details": "$(escape_json "$details")",
+    "timestamp": "$(date '+%Y-%m-%d %H:%M:%S')"
+}
+EOF
+    exit 1
+}
+
+# ===== LẤY THAM SỐ TỪ REQUEST =====
+MESSAGE_ID=""
+READ_STATUS=""
+
+if [ "$REQUEST_METHOD" = "POST" ]; then
+    if [ -n "$CONTENT_LENGTH" ] && [ "$CONTENT_LENGTH" -gt 0 ]; then
+        POST_DATA=$(dd bs="$CONTENT_LENGTH" count=1 2>/dev/null)
+    else
+        read -r POST_DATA
+    fi
+    log_debug "POST_DATA: $POST_DATA"
+
+    CONTENT_TYPE_LOWER=$(echo "$CONTENT_TYPE" | tr '[:upper:]' '[:lower:]')
+    if echo "$CONTENT_TYPE_LOWER" | grep -q "application/json"; then
+        MESSAGE_ID=$(echo "$POST_DATA" | sed -n 's/.*"message_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        if [ -z "$MESSAGE_ID" ]; then
+            MESSAGE_ID=$(echo "$POST_DATA" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        fi
+
+        READ_STATUS=$(echo "$POST_DATA" | sed -n 's/.*"read_status"[[:space:]]*:[[:space:]]*\([01]\).*/\1/p')
+        if [ -z "$READ_STATUS" ]; then
+            READ_STATUS=$(echo "$POST_DATA" | sed -n 's/.*"read"[[:space:]]*:[[:space:]]*\([01]\).*/\1/p')
+        fi
+    else
+        MESSAGE_ID=$(echo "$POST_DATA" | sed -n 's/.*id=\([^&]*\).*/\1/p')
+        if [ -z "$MESSAGE_ID" ]; then
+            MESSAGE_ID=$(echo "$POST_DATA" | sed -n 's/.*message_id=\([^&]*\).*/\1/p')
+        fi
+
+        READ_STATUS=$(echo "$POST_DATA" | sed -n 's/.*read_status=\([^&]*\).*/\1/p')
+        if [ -z "$READ_STATUS" ]; then
+            READ_STATUS=$(echo "$POST_DATA" | sed -n 's/.*read=\([^&]*\).*/\1/p')
+        fi
+    fi
+else
+    MESSAGE_ID=$(echo "$QUERY_STRING" | sed -n 's/.*id=\([^&]*\).*/\1/p')
+    if [ -z "$MESSAGE_ID" ]; then
+        MESSAGE_ID=$(echo "$QUERY_STRING" | sed -n 's/.*message_id=\([^&]*\).*/\1/p')
+    fi
+
+    READ_STATUS=$(echo "$QUERY_STRING" | sed -n 's/.*read_status=\([^&]*\).*/\1/p')
+    if [ -z "$READ_STATUS" ]; then
+        READ_STATUS=$(echo "$QUERY_STRING" | sed -n 's/.*read=\([^&]*\).*/\1/p')
+    fi
+    log_debug "QUERY_STRING: $QUERY_STRING"
+fi
+
+log_debug "Parsed MESSAGE_ID: $MESSAGE_ID"
+log_debug "Parsed READ_STATUS: $READ_STATUS"
+
+# ===== KIỂM TRA ĐẦU VÀO =====
+if [ -z "$MESSAGE_ID" ]; then
+    return_error "missing_message_id" "Thiếu tham số message ID" "Vui lòng cung cấp 'id' hoặc 'message_id'"
+fi
+
+if [ -z "$READ_STATUS" ]; then
+    return_error "missing_read_status" "Thiếu tham số read status" "Vui lòng cung cấp 'read_status' hoặc 'read' (0 hoặc 1)"
+fi
+
+CLEAN_ID=$(echo "$MESSAGE_ID" | sed 's/[^0-9]//g')
+if [ -z "$CLEAN_ID" ] || [ "$CLEAN_ID" = "0" ]; then
+    return_error "invalid_message_id" "ID tin nhắn không hợp lệ" "ID phải là số nguyên dương: '$MESSAGE_ID'"
+fi
+
+if [ "$READ_STATUS" != "0" ] && [ "$READ_STATUS" != "1" ]; then
+    return_error "invalid_read_status" "Trạng thái đọc không hợp lệ" "read_status phải là 0 (chưa đọc) hoặc 1 (đã đọc): '$READ_STATUS'"
+fi
+
+if [ ! -d "$ARCHIVE_DIR" ]; then
+    return_error "archive_not_found" "Thư mục archive không tồn tại" "Đường dẫn: $ARCHIVE_DIR"
+fi
+
+# ===== XÁC ĐỊNH FILE THÁNG TƯƠNG ỨNG =====
+CURRENT_MONTH=$(date "+%Y-%m")
+MONTHLY_FILE="$ARCHIVE_DIR/messages-${CURRENT_MONTH}.json"
+
+if [ ! -f "$MONTHLY_FILE" ]; then
+    return_error "archive_file_not_found" "File archive tháng không tồn tại" "Đường dẫn: $MONTHLY_FILE"
+fi
+
+if [ ! -r "$MONTHLY_FILE" ] || [ ! -w "$MONTHLY_FILE" ]; then
+    return_error "archive_file_permission_error" "Không có quyền truy cập file archive" "File: $MONTHLY_FILE"
+fi
+
+log_debug "Using archive file: $MONTHLY_FILE"
+
+# ===== CẬP NHẬT read_status TRONG MẢNG messages THEO ID =====
+if ! command -v jq >/dev/null 2>&1; then
+    return_error "jq_missing" "Lệnh jq không được cài đặt" "Không thể xử lý file JSON"
+fi
+
+TEMP_FILE="/tmp/messages_temp_$$.json"
+
+jq --argjson id "$CLEAN_ID" --argjson rs "$READ_STATUS" '
+    .messages |= map(
+        if .id == $id then .read_status = $rs else . end
+    )
+' "$MONTHLY_FILE" > "$TEMP_FILE"
+
+if [ $? -ne 0 ] || [ ! -s "$TEMP_FILE" ]; then
+    return_error "jq_update_failed" "Cập nhật read_status thất bại" "Lỗi khi xử lý jq"
+fi
+
+# Tạo bản sao lưu trước khi ghi
+BACKUP_FILE="/tmp/messages-$(date +%Y%m%d_%H%M%S).backup.json"
+cp "$MONTHLY_FILE" "$BACKUP_FILE" 2>/dev/null
+log_debug "Tạo bản backup: $BACKUP_FILE"
+
+# Ghi lại file archive đã cập nhật
+if mv "$TEMP_FILE" "$MONTHLY_FILE"; then
+    log_debug "Cập nhật read_status cho message_id $CLEAN_ID thành công."
+
+    cat << EOF
+{
+    "success": true,
+    "status": "success",
+    "message": "Cập nhật trạng thái đọc tin nhắn thành công",
+    "message_id": $CLEAN_ID,
+    "read_status": $READ_STATUS,
+    "changed": true,
+    "archive_file": "$MONTHLY_FILE",
+    "backup_file": "$BACKUP_FILE",
+    "timestamp": "$(date '+%Y-%m-%d %H:%M:%S')"
+}
+EOF
+    exit 0
+else
+    # Rollback
+    cp "$BACKUP_FILE" "$MONTHLY_FILE" 2>/dev/null
+    return_error "file_write_error" "Không thể ghi file archive sau cập nhật" "Đã rollback về bản backup"
+fi

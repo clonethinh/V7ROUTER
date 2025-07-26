@@ -1,0 +1,479 @@
+#!/bin/sh
+echo "Content-Type: application/json; charset=utf-8"
+echo ""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SMS-SEND - IMPROVED VERSION (NO BACKUP)
+# Features: Enhanced locking, cleanup, error handling, JSON processing
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─── CẤU HÌNH THƯ MỤC/FILE ─────────────────────────────────────────────────────
+ARCHIVE_DIR="/root/sms-archive"
+SENT_TIME_LOG="/tmp/sms_sent_times"
+SEND_LOG="/tmp/sms-send.log"
+TEMP_FILE="/tmp/sms_send_temp_$$.json"
+
+# Cấu hình lock
+LOCK_TIMEOUT=5
+STALE_LOCK_SEC=60
+
+# Tạo thư mục nếu chưa có
+mkdir -p "$ARCHIVE_DIR"
+
+# ─── HÀM TIỆN ÍCH ──────────────────────────────────────────────────────────────
+log() { 
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $*" >> "$SEND_LOG"
+}
+
+# Hàm cleanup toàn diện
+cleanup_and_exit() {
+    local exit_code=$1
+    local message="$2"
+    
+    # Unlock file descriptor 300
+    flock -u 300 2>/dev/null
+    
+    # Xóa lock file và temp file
+    rm -f "$LOCK_FILE" 2>/dev/null
+    rm -f "$TEMP_FILE" 2>/dev/null
+    
+    log "Cleanup completed - Exit code: $exit_code"
+    
+    # Trả về JSON error nếu có message
+    if [ -n "$message" ]; then
+        echo "{\"status\":\"error\",\"message\":\"$(json_escape "$message")\",\"timestamp\":\"$(date '+%Y-%m-%d %H:%M:%S')\"}"
+    fi
+    
+    exit "$exit_code"
+}
+
+# Trap signals để cleanup khi bị kill
+trap 'cleanup_and_exit 1 "Script bị dừng bởi signal"' INT TERM
+
+# Hàm decode URL
+urldecode() { 
+    printf '%b' "${1//+/ }" | sed 's/%/\\x/g; s/\t/\\t/g; s/\r/\\r/g; s/\n/\\n/g' | xargs -0 printf '%b' 2>/dev/null || echo "$1"
+}
+
+# Hàm escape JSON an toàn
+json_escape() { 
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g; s/\r/\\r/g; s/\n/\\n/g'
+}
+
+# Hàm return error
+return_error() {
+    local code="$1"
+    local message="$2"
+    local details="$3"
+    
+    log "ERROR: $code - $message - $details"
+    
+    cat << EOF
+{
+    "status": "error",
+    "error_code": "$code",
+    "message": "$(json_escape "$message")",
+    "details": "$(json_escape "$details")",
+    "timestamp": "$(date '+%Y-%m-%d %H:%M:%S')"
+}
+EOF
+    cleanup_and_exit 1
+}
+
+log "=== SMS-SEND START (NO BACKUP) ==="
+
+# ─── TÌM MODEM ACTIVE ──────────────────────────────────────────────────────────
+MODEM_ID=$(mmcli -L 2>/dev/null | grep -o '/Modem/[0-9]\+' | head -n1 | awk -F/ '{print $NF}')
+
+if [ -z "$MODEM_ID" ]; then
+    return_error "no_modem" "Không tìm thấy modem hoạt động" "Kiểm tra kết nối modem"
+fi
+
+log "Found active modem: $MODEM_ID"
+
+# ─── LẤY THAM SỐ TỪ REQUEST ────────────────────────────────────────────────────
+read_request_body() { 
+    if [ -n "$CONTENT_LENGTH" ] && [ "$CONTENT_LENGTH" -gt 0 ]; then
+        dd bs="$CONTENT_LENGTH" count=1 2>/dev/null
+    else
+        cat
+    fi
+}
+
+if [ "$REQUEST_METHOD" = "POST" ]; then
+    DATA=$(read_request_body)
+    log "POST request, data length: ${#DATA}"
+else
+    DATA="$QUERY_STRING"
+    log "GET request, query: $DATA"
+fi
+
+# Parse parameters từ JSON hoặc form-urlencoded
+NUMBER=""
+TEXT=""
+
+if echo "$DATA" | grep -q '"number"'; then
+    # JSON format: {"number":"xxx","text":"yyy"}
+    NUMBER=$(echo "$DATA" | sed -n 's/.*"number"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    TEXT=$(echo "$DATA" | sed -n 's/.*"text"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    log "Parsed JSON format"
+else
+    # Form-urlencoded: number=xxx&text=yyy
+    NUMBER=$(echo "$DATA" | sed -n 's/.*number=\([^&]*\).*/\1/p')
+    TEXT=$(echo "$DATA" | sed -n 's/.*text=\([^&]*\).*/\1/p')
+    log "Parsed form-urlencoded format"
+fi
+
+# URL decode
+NUMBER=$(urldecode "$NUMBER")
+TEXT=$(urldecode "$TEXT")
+
+log "Parsed - Number: '$NUMBER', Text length: ${#TEXT}"
+
+# Validation
+if [ -z "$NUMBER" ]; then
+    return_error "missing_number" "Thiếu số điện thoại" "Parameter 'number' is required"
+fi
+
+if [ -z "$TEXT" ]; then
+    return_error "missing_text" "Thiếu nội dung tin nhắn" "Parameter 'text' is required"
+fi
+
+# Validate phone number format (basic)
+if echo "$NUMBER" | grep -qvE '^[0-9+\-\(\)\s]+$'; then
+    return_error "invalid_number" "Số điện thoại không hợp lệ" "Number: $NUMBER"
+fi
+
+# Validate text length
+if [ "${#TEXT}" -gt 1600 ]; then
+    return_error "text_too_long" "Nội dung tin nhắn quá dài" "Độ dài: ${#TEXT} ký tự (tối đa 1600)"
+fi
+
+# ─── TẠO VÀ GỬI SMS ────────────────────────────────────────────────────────────
+log "Creating SMS..."
+
+CREATE_OUTPUT=$(mmcli -m "$MODEM_ID" --messaging-create-sms="number='$NUMBER',text='$TEXT'" 2>&1)
+log "Create SMS output: $CREATE_OUTPUT"
+
+# Extract SMS path
+SMS_PATH=$(echo "$CREATE_OUTPUT" | grep -o '/org/freedesktop/ModemManager1/SMS/[0-9]*')
+
+if [ -z "$SMS_PATH" ]; then
+    return_error "sms_create_failed" "Không thể tạo SMS" "Output: $CREATE_OUTPUT"
+fi
+
+SMS_ID=${SMS_PATH##*/}
+log "Created SMS successfully - Path: $SMS_PATH, ID: $SMS_ID"
+
+# Gửi SMS
+log "Sending SMS ID $SMS_ID..."
+SEND_OUTPUT=$(mmcli -s "$SMS_PATH" --send 2>&1)
+log "Send SMS output: $SEND_OUTPUT"
+
+if ! echo "$SEND_OUTPUT" | grep -qi "successfully sent"; then
+    return_error "sms_send_failed" "Gửi SMS thất bại" "Output: $SEND_OUTPUT"
+fi
+
+log "SMS $SMS_ID sent successfully"
+
+# ─── GHI TIMESTAMP VÀO LOG ─────────────────────────────────────────────────────
+SEND_TIME=$(date '+%Y-%m-%dT%H:%M:%S+07:00')
+echo "${SMS_ID}:${SEND_TIME}" >> "$SENT_TIME_LOG"
+
+# Cleanup sent time log (giữ 100 entries cuối)
+if [ -f "$SENT_TIME_LOG" ]; then
+    tail -100 "$SENT_TIME_LOG" > "${SENT_TIME_LOG}.tmp" && mv "${SENT_TIME_LOG}.tmp" "$SENT_TIME_LOG"
+fi
+
+log "Logged send time: $SMS_ID -> $SEND_TIME"
+
+# ─── KHỞI TẠO MONTHLY ARCHIVE FILE ────────────────────────────────────────────
+MONTH=$(date '+%Y-%m')
+MONTHLY_FILE="$ARCHIVE_DIR/messages-${MONTH}.json"
+LOCK_FILE="${MONTHLY_FILE}.lock"
+
+# Tạo file monthly nếu chưa có
+if [ ! -f "$MONTHLY_FILE" ]; then
+    log "Creating new monthly file: $MONTHLY_FILE"
+    
+    cat > "$MONTHLY_FILE" <<EOF
+{
+  "month": "$MONTH",
+  "messages": [],
+  "total": 0,
+  "last_updated": "$(date '+%Y-%m-%d %H:%M:%S')",
+  "version": "1.0",
+  "created_at": "$(date '+%Y-%m-%d %H:%M:%S')"
+}
+EOF
+    
+    if [ ! -f "$MONTHLY_FILE" ] || [ ! -s "$MONTHLY_FILE" ]; then
+        return_error "monthly_file_create_failed" "Không thể tạo file archive tháng" "Path: $MONTHLY_FILE"
+    fi
+    
+    log "Monthly file created successfully"
+else
+    log "Monthly file exists: $MONTHLY_FILE"
+    
+    # Validate JSON structure
+    if command -v jq >/dev/null 2>&1; then
+        if ! jq . "$MONTHLY_FILE" >/dev/null 2>&1; then
+            log "WARNING: Monthly file is corrupted, backing up and recreating..."
+            mv "$MONTHLY_FILE" "${MONTHLY_FILE}.corrupted.$(date +%s)"
+            
+            cat > "$MONTHLY_FILE" <<EOF
+{
+  "month": "$MONTH",
+  "messages": [],
+  "total": 0,
+  "last_updated": "$(date '+%Y-%m-%d %H:%M:%S')",
+  "version": "1.0",
+  "created_at": "$(date '+%Y-%m-%d %H:%M:%S')"
+}
+EOF
+        fi
+    fi
+fi
+
+# ─── FILE LOCKING VỚI TIMEOUT & XỬ LÝ STALE LOCK ──────────────────────────────
+log "Acquiring file lock..."
+
+exec 300>"$LOCK_FILE"
+LOCK_ACQUIRED=false
+
+# Thử lock với timeout
+for i in $(seq 1 $LOCK_TIMEOUT); do
+    if flock -n 300; then
+        LOCK_ACQUIRED=true
+        log "Lock acquired on attempt $i"
+        break
+    else
+        log "Lock attempt $i failed, waiting..."
+        [ "$i" -lt "$LOCK_TIMEOUT" ] && sleep 1
+    fi
+done
+
+# Nếu vẫn không lock được, kiểm tra stale lock
+if [ "$LOCK_ACQUIRED" = "false" ]; then
+    if [ -f "$LOCK_FILE" ]; then
+        LOCK_AGE=$(( $(date +%s) - $(stat -c %Y "$LOCK_FILE" 2>/dev/null || echo 0) ))
+        log "Lock file age: ${LOCK_AGE} seconds"
+        
+        if [ "$LOCK_AGE" -gt "$STALE_LOCK_SEC" ]; then
+            log "Removing stale lock file (age: ${LOCK_AGE}s)"
+            rm -f "$LOCK_FILE"
+            
+            # Thử lock lần cuối
+            exec 300>"$LOCK_FILE"
+            if flock -n 300; then
+                LOCK_ACQUIRED=true
+                log "Successfully acquired lock after removing stale lock"
+            fi
+        fi
+    fi
+    
+    if [ "$LOCK_ACQUIRED" = "false" ]; then
+        return_error "file_locked" "File archive đang bị sử dụng" "Thử lại sau ${LOCK_TIMEOUT} lần"
+    fi
+fi
+
+log "File lock acquired successfully"
+
+# ─── TẠO MESSAGE JSON OBJECT ───────────────────────────────────────────────────
+MSG_JSON=$(cat <<EOF
+{
+  "id": $SMS_ID,
+  "number": "$(json_escape "$NUMBER")",
+  "text": "$(json_escape "$TEXT")",
+  "date": "$SEND_TIME",
+  "type": "submit",
+  "state": "sent",
+  "storage": "router",
+  "read_status": 1
+}
+EOF
+)
+
+log "Created message JSON for SMS $SMS_ID"
+
+# ─── THÊM MESSAGE VÀO MONTHLY FILE (NO BACKUP) ────────────────────────────────
+ARCHIVE_SUCCESS=false
+
+if command -v jq >/dev/null 2>&1; then
+    log "Using jq for JSON processing"
+    
+    CURRENT_TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    NEW_CONTENT=$(jq --argjson msg "$MSG_JSON" --arg timestamp "$CURRENT_TIMESTAMP" '
+        .messages += [$msg] |
+        .total = (.messages | length) |
+        .last_updated = $timestamp
+    ' "$MONTHLY_FILE" 2>/dev/null)
+    
+    if [ $? -eq 0 ] && [ -n "$NEW_CONTENT" ]; then
+        echo "$NEW_CONTENT" > "$TEMP_FILE"
+        
+        if [ -s "$TEMP_FILE" ]; then
+            mv "$TEMP_FILE" "$MONTHLY_FILE"
+            ARCHIVE_SUCCESS=true
+            log "Successfully added message using jq"
+        else
+            log "jq: temp file empty, trying awk fallback"
+        fi
+    else
+        log "jq processing failed, trying awk fallback"
+    fi
+fi
+
+# AWK fallback nếu jq không có hoặc thất bại
+if [ "$ARCHIVE_SUCCESS" = "false" ]; then
+    log "Using awk for JSON processing"
+    
+    awk -v new_msg="$MSG_JSON" -v timestamp="$(date '+%Y-%m-%d %H:%M:%S')" '
+    BEGIN { 
+        found_messages = 0
+        added = 0
+        in_messages_array = 0
+        message_count = 0
+    }
+    
+    # Tìm mảng messages
+    /"messages"[[:space:]]*:[[:space:]]*\[/ {
+        print $0
+        found_messages = 1
+        in_messages_array = 1
+        next
+    }
+    
+    # Kết thúc mảng messages
+    found_messages && /^[[:space:]]*\]/ && in_messages_array {
+        if (!added && new_msg != "") {
+            if (message_count > 0) {
+                print ","
+            }
+            print "    " new_msg
+            added = 1
+        }
+        print $0
+        in_messages_array = 0
+        found_messages = 0
+        next
+    }
+    
+    # Trong mảng messages
+    in_messages_array {
+        if (/^[[:space:]]*{/ && !added) {
+            message_count++
+        }
+        print $0
+        next
+    }
+    
+    # Cập nhật total count
+    /"total"[[:space:]]*:[[:space:]]*[0-9]+/ {
+        if (added) {
+            gsub(/[0-9]+/, message_count + 1)
+        }
+        print $0
+        next
+    }
+    
+    # Cập nhật timestamp
+    /"last_updated"/ {
+        gsub(/"[^"]*"$/, "\"" timestamp "\"")
+        print $0
+        next
+    }
+    
+    # In tất cả dòng khác
+    { print }
+    
+    END {
+        if (!added) {
+            print "AWK: Failed to add message" > "/dev/stderr"
+        }
+    }
+    ' "$MONTHLY_FILE" > "$TEMP_FILE"
+    
+    if [ -s "$TEMP_FILE" ]; then
+        mv "$TEMP_FILE" "$MONTHLY_FILE"
+        ARCHIVE_SUCCESS=true
+        log "Successfully added message using awk"
+    else
+        log "awk processing also failed"
+        rm -f "$TEMP_FILE"
+    fi
+fi
+
+if [ "$ARCHIVE_SUCCESS" = "false" ]; then
+    log "WARNING: Failed to archive SMS $SMS_ID to monthly file"
+fi
+
+# ─── XÓA SMS KHỎI SIM (TIẾT KIỆM BỘ NHỚ) ───────────────────────────────────────
+log "Deleting SMS $SMS_ID from SIM..."
+
+DELETE_SUCCESS=false
+
+# Thử xóa bằng SMS path
+DELETE_OUTPUT=$(mmcli -s "$SMS_PATH" --delete 2>&1)
+if echo "$DELETE_OUTPUT" | grep -qi "successfully deleted"; then
+    DELETE_SUCCESS=true
+    log "Successfully deleted SMS using SMS path"
+else
+    log "Failed to delete using SMS path: $DELETE_OUTPUT"
+    
+    # Thử xóa bằng SMS ID
+    DELETE_OUTPUT2=$(mmcli -m "$MODEM_ID" --messaging-delete-sms="$SMS_ID" 2>&1)
+    if echo "$DELETE_OUTPUT2" | grep -qi "successfully deleted"; then
+        DELETE_SUCCESS=true
+        log "Successfully deleted SMS using SMS ID"
+    else
+        log "Failed to delete using SMS ID: $DELETE_OUTPUT2"
+    fi
+fi
+
+# ─── TẠO RESPONSE JSON ─────────────────────────────────────────────────────────
+log "Creating response JSON..."
+
+RESPONSE_JSON=$(cat <<EOF
+{
+  "status": "success",
+  "message": "SMS đã được gửi thành công (no backup)",
+  "data": {
+    "sms_id": $SMS_ID,
+    "number": "$(json_escape "$NUMBER")",
+    "text": "$(json_escape "$TEXT")",
+    "date": "$SEND_TIME",
+    "type": "submit",
+    "state": "sent",
+    "storage": "router",
+    "read_status": 1
+  },
+  "archive": {
+    "monthly_file": "$MONTHLY_FILE",
+    "archived": $ARCHIVE_SUCCESS,
+    "backup_created": false,
+    "deleted_from_sim": $DELETE_SUCCESS
+  },
+  "processing": {
+    "method": "$(command -v jq >/dev/null && echo 'jq' || echo 'awk')",
+    "lock_acquired": true,
+    "modem_id": "$MODEM_ID"
+  },
+  "timestamp": "$(date '+%Y-%m-%d %H:%M:%S')"
+}
+EOF
+)
+
+echo "$RESPONSE_JSON"
+
+log "SMS send operation completed successfully (no backup) - ID: $SMS_ID, Archive: $ARCHIVE_SUCCESS, Delete: $DELETE_SUCCESS"
+
+# ─── CLEANUP CUỐI SCRIPT ───────────────────────────────────────────────────────
+cleanup_and_exit 0
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# END OF SMS-SEND SCRIPT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
