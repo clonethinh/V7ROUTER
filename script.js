@@ -1046,11 +1046,12 @@ class SMSManager {
     
             console.log('=== PARSING BACKEND RESPONSE ===');
             console.log('Total messages:', messagesArray.length);
+            console.log('First 5 IDs from backend:', messagesArray.slice(0, 5).map(m => m.id));
     
-            return messagesArray.map(item => {
+            const mappedMessages = messagesArray.map(item => {
                 console.log('Raw message data:', {
                     id: item.id,
-                    read_status: item.read_status, // Kiểm tra field này
+                    read_status: item.read_status,
                     state: item.state,
                     type: item.type
                 });
@@ -1061,27 +1062,34 @@ class SMSManager {
                     content: item.text || '',
                     type: item.type === 'deliver' ? 'received' : 'sent',
                     timestamp: new Date(item.date),
-                    // QUAN TRỌNG: Kiểm tra backend trả về field gì cho read status
                     read: this.determineReadStatus(item),
                     status: this.mapBackendState(item.state, item.type),
                     storage: item.storage || 'unknown',
                     _raw: item
                 };
     
-                console.log('Mapped read status:', {
+                console.log('Mapped message:', {
                     id: mappedMessage.id,
                     read: mappedMessage.read,
-                    originalData: item
+                    type: mappedMessage.type
                 });
     
                 return mappedMessage;
-            }).sort((a, b) => b.timestamp - a.timestamp);
+            });
+            
+            // ✅ QUAN TRỌNG: KHÔNG SORT LẠI - giữ nguyên thứ tự từ backend
+            // Backend đã sort theo ID giảm dần rồi
+            console.log('Final mapped IDs (keeping backend order):', 
+                mappedMessages.slice(0, 5).map(m => m.id));
+            
+            return mappedMessages;
     
         } catch (error) {
             console.error('Error parsing backend response:', error);
             return [];
         }
     }
+
     
     // Cập nhật method determineReadStatus
     determineReadStatus(item) {
